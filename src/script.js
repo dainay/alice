@@ -2,7 +2,7 @@ import * as THREE from 'three/webgpu'
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js'
 import { Inspector } from 'three/addons/inspector/Inspector.js'
 import { bloom } from 'three/examples/jsm/tsl/display/BloomNode.js'
-import { pass, instancedArray, Fn, uniform, positionLocal, instanceIndex, hash, vec3, deltaTime, Loop, If, EPSILON, dot } from 'three/tsl'
+import { pass, instancedArray, Fn, uniform, positionLocal, instanceIndex, hash, vec3, deltaTime, Loop, If, EPSILON, dot, oneMinus, color } from 'three/tsl'
 
 /**
  * Base
@@ -77,12 +77,47 @@ const gravityDirection = vec3(0, -1, 0)
 // Buffers
 const positionsBuffer = instancedArray(count, 'vec3')
 const velocitiesBuffer = instancedArray(count, 'vec3')
+const heatBuffer = instancedArray(count, 'float')
 
 // Uniforms
 const radius = uniform(0.5)
 const gravityStrength = uniform(0.01)
 const impactDamping = uniform(0.05)
 const generalDamping = uniform(0.4)
+const heatDamping = uniform(3)
+
+const cylinderCenter = new THREE.Vector3(0, 0, 0)
+const cylinderRadius = 2
+const cylinderHalfHeight = 8
+
+// uniforms of the bottle-cillinder
+const cylinderRadiusUniform = uniform(cylinderRadius)
+const cylinderCenterUniform = uniform(cylinderCenter)
+const cylinderHalfHeightUniform = uniform(cylinderHalfHeight)
+const heatImpactStrength = uniform(30)
+const emissiveColor = uniform(color(0xff3f0f))
+
+ 
+const cylinderGeometry = new THREE.CylinderGeometry(
+    cylinderRadius,
+    cylinderRadius,
+    cylinderHalfHeight * 2,
+    32
+)
+
+const cylinderMaterial = new THREE.MeshBasicMaterial({
+    color: 0x0202020,
+    wireframe: true
+})
+
+const cylinderMesh = new THREE.Mesh(
+    cylinderGeometry,
+    cylinderMaterial
+)
+
+cylinderMesh.position.copy(cylinderCenter)
+scene.add(cylinderMesh)
+
 
 // Computes
 const initCompute = Fn(() => {
@@ -105,23 +140,25 @@ const updateCompute = Fn(() => {
     // Buffers
     const aPosition = positionsBuffer.element(instanceIndex)
     const aVelocity = velocitiesBuffer.element(instanceIndex)
+    const aHeat = heatBuffer.element(instanceIndex)
 
     // Apply gravity
     const gravityVelocity = gravityDirection.mul(gravityStrength).mul(clampedDeltaTime)
     aVelocity.addAssign(gravityVelocity)
 
 
-    // Spheres collision
+      // Sphere-sphere collisions
     Loop({ start: instanceIndex.add(1), end: count, condition: '<', name: 'i' }, ({ i }) => {
         // Buffers
         const bPosition = positionsBuffer.element(i)
         const bVelocity = velocitiesBuffer.element(i)
+        const bHeat = heatBuffer.element(i)
 
         // Distance between current sphere and other i spheres
         const delta = bPosition.sub(aPosition)
         const distance = delta.length()
 
-        // Выбери максимальное из distance и 2.radius, чтобы избежать деления на ноль
+        // max between distance and EPSILON to avoid division by zero
         const direction = delta.div(distance.max(EPSILON))
 
         // Is touching
@@ -144,18 +181,61 @@ const updateCompute = Fn(() => {
             //we put together force and the direction to get fianl impact
             //impact damping is for making the energy to fade 
             const impactVelocity = direction.mul(impactStrength).mul(impactDamping.oneMinus())
-
-
             aVelocity.subAssign(impactVelocity).mulAssign(generalDamping.mul(clampedDeltaTime).oneMinus())
             bVelocity.addAssign(impactVelocity)
+
+            // Impact heat
+            const heat = impactStrength.sub(0.01).max(0).mul(heatImpactStrength)
+            aHeat.addAssign(heat).mulAssign(heatDamping.mul(clampedDeltaTime).oneMinus())
+            bHeat.addAssign(heat)
         })
-
-
     })
 
-
-    // Apply velocity
+    // Apply velocity - moving with speed in exact direction
     aPosition.addAssign(aVelocity)
+
+
+    // CYLINDER COLLISION
+
+    // relative position of the sphere to the center of the cylinder - how far is the center of the sphere from the center of the cylinder
+    const relativePositionByCylinder = aPosition.sub(cylinderCenterUniform)
+    // horizontal distance from the center of the cylinder to the sphere - how far is the sphere from the center of the cylinder in the xz plane
+    const horizontalDistanceFromCenter = relativePositionByCylinder.xz.length()
+    // maxRadialDistance  and maxVerticalDistance  are the maximum distances from the center of the cylinder to the sphere in the xz plane and y axis respectively, taking into account the radius of the sphere
+    const maxRadialDistance  = cylinderRadiusUniform.sub(radius)
+    const maxVerticalDistance  = cylinderHalfHeightUniform.sub(radius)
+    const minVerticalDistance  = cylinderHalfHeightUniform.mul(-1).add(radius)
+ 
+    // side collision
+    If(
+        //if in horisontal plane the distance of left/right is bigger than distance on the same height from the center
+        horizontalDistanceFromCenter.greaterThan(maxRadialDistance ),
+        () =>
+        {
+            const normal = relativePositionByCylinder.xz.normalize()
+            const acceptableHorisontalPosition = normal.mul(maxRadialDistance )
+            //move back the sphere to the acceptable position on the xz plane, keeping the y position the same
+            aPosition.x.assign(cylinderCenterUniform.x.add(acceptableHorisontalPosition.x))
+            aPosition.z.assign(cylinderCenterUniform.z.add(acceptableHorisontalPosition.y))
+
+            //new velocity from the cylinder
+            const velocityAgainstNormal = dot( aVelocity.xz, normal)
+            const reflectedVelocity = aVelocity.xz.sub(normal.mul(velocityAgainstNormal.mul(2)))
+            aVelocity.x.assign(reflectedVelocity.x)
+            aVelocity.z.assign(reflectedVelocity.y)
+        }
+    )
+ 
+        If(relativePositionByCylinder.y.lessThan(minVerticalDistance), () =>
+        {
+            // Put sphere back exactly on the bottom
+            aPosition.y.assign(
+                cylinderCenterUniform.y.add(minVerticalDistance)
+            )
+
+            // Bounce upward
+            aVelocity.y.mulAssign(-1)
+        })
 
 })().compute(count)
 
@@ -176,6 +256,10 @@ material.positionNode = Fn(() => {
     return positionLocal
 })()
 
+// Emissive
+const heat = heatBuffer.element(instanceIndex)
+material.emissiveNode = emissiveColor.mul(heat)
+
 
 const mesh = new THREE.Mesh(geometry, material)
 mesh.castShadow = true
@@ -195,8 +279,9 @@ spheresGui.add(gravityStrength, 'value', 0, 0.1, 0.001).name('gravityStrength')
 // spheresGui.add(count, 'value', 0, 100, 1).name('count')
 spheresGui.add(impactDamping, 'value', 0, 1, 0.001).name('impactDamping')
 spheresGui.add(generalDamping, 'value', 0, 1, 0.01).name('generalDamping')
-
-
+spheresGui.add(heatDamping, 'value', 0, 10, 0.1).name('heatDamping')
+spheresGui.add(heatImpactStrength, 'value', 0, 100, 0.1).name('heatImpactStrength')
+spheresGui.addColor(emissiveColor, 'value').name('emissiveColor')
 
 
 
