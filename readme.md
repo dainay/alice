@@ -1,4 +1,4 @@
-# Three.js Journey
+# Made thanks to Three.js Journey
 
 ## Setup
 Download [Node.js](https://nodejs.org/en/download/).
