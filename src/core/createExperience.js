@@ -51,7 +51,7 @@ export const createExperience = async (canvas) => {
         onComplete: () => {
             controls.enabled = true
         }
-    }, 3)
+    }, 4)
 
     // const inspector = new Inspector()
     // renderer.inspector = inspector
